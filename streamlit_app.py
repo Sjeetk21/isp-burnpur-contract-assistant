@@ -243,111 +243,101 @@ for col, q in zip(cols * 2, QUICK):
     if col.button(q, use_container_width=True):
         st.session_state.pending_question = q
 
-# ─── Main tabs ─────────────────────────────────────────────────────────────────
-tab_chat, tab_refs, tab_about = st.tabs(["💬 Chat", "📑 References", "ℹ️ Accuracy Notes"])
 
-# ── Chat tab ──────────────────────────────────────────────────────────────────
-with tab_chat:
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+# CHAT INTERFACE
 
-    typed = st.chat_input("Ask about scope, specs, dimensions, safety, inspection, payment, exclusions…")
-    question = st.session_state.pop("pending_question", None) or typed
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-    if question:
-        st.session_state.messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
+question = (
+    st.session_state.pop("pending_question", None)
+    or st.chat_input(
+        "Ask about scope, specs, dimensions, safety, inspection, payment, exclusions..."
+    )
+)
 
-        with st.chat_message("assistant"):
-            q_type = "Descriptive" if is_descriptive(question) else "Factual"
-            badge = f'<span class="badge">{q_type}</span>'
-            st.markdown(badge, unsafe_allow_html=True)
+if question:
 
-            with st.spinner("Retrieving contract references and preparing answer…"):
-                # Descriptive questions get more references automatically
-                effective_k = min(top_k + 4, 16) if is_descriptive(question) else top_k
-                hits = index.search(question, top_k=effective_k)
-                st.session_state.last_hits = hits
+    st.session_state.messages.append(
+        {"role": "user", "content": question}
+    )
 
-                if hits:
-                    answer = build_answer(question, hits, model)
-                else:
-                    answer = (
-                        "No matching contract evidence was found for your query. "
-                        "Try rephrasing using clause names, equipment names, or exact technical terms."
-                    )
+    with st.chat_message("user"):
+        st.markdown(question)
 
-            st.markdown(answer)
+    with st.chat_message("assistant"):
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        st.info("📑 Open the **References** tab to verify the exact contract excerpts used.", icon="ℹ️")
+        q_type = "Descriptive" if is_descriptive(question) else "Factual"
+        badge = f'<span class="badge">{q_type}</span>'
+        st.markdown(badge, unsafe_allow_html=True)
 
-# ── References tab ────────────────────────────────────────────────────────────
-with tab_refs:
-    st.subheader("Retrieved Contract References")
+        with st.spinner("Retrieving contract references and preparing answer..."):
+
+            effective_k = min(top_k + 4, 16) if is_descriptive(question) else top_k
+            hits = index.search(question, top_k=effective_k)
+            st.session_state.last_hits = hits
+
+            if hits:
+                answer = build_answer(question, hits, model)
+            else:
+                answer = (
+                    "No matching contract evidence was found for your query. "
+                    "Try rephrasing using clause names, equipment names, or exact technical terms."
+                )
+
+        st.markdown(answer)
+
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer}
+    )
+
+    st.rerun()
+
+with st.expander("📑 References Used", expanded=False):
+
     if not st.session_state.last_hits:
         st.info("Ask a question first — the exact contract excerpts used will appear here.")
     else:
-        st.caption(
-            f"{len(st.session_state.last_hits)} segment(s) retrieved. "
-            "Segments marked *(neighbor)* are adjacent chunks added for context."
-        )
+        st.caption(f"{len(st.session_state.last_hits)} segment(s) retrieved.")
+
         for i, hit in enumerate(st.session_state.last_hits, 1):
+
             meta = hit["metadata"]
             excerpt = html.escape(hit.get("text", "")[:2000])
             label = html.escape(source_label(hit, i))
             score_str = f"{hit.get('score', 0):.3f}"
             src_type = html.escape(str(meta.get("source_type", "—")))
             chapter = html.escape(str(meta.get("chapter", "—")))
-            neighbor_note = " &nbsp;<em style='color:#888;font-size:.8rem'>(neighbor)</em>" if hit.get("_neighbor") else ""
 
             st.markdown(
                 f"""
                 <div class="ref-card">
-                  <div class="ref-title">{label}{neighbor_note}</div>
-                  <div class="ref-meta">Score: {score_str} &nbsp;|&nbsp; Type: {src_type} &nbsp;|&nbsp; Chapter: {chapter}</div>
-                  <div class="ref-text">{excerpt}</div>
+                    <div class="ref-title">{label}</div>
+                    <div class="ref-meta">
+                        Score: {score_str} | Type: {src_type} | Chapter: {chapter}
+                    </div>
+                    <div class="ref-text">{excerpt}</div>
                 </div>
                 """,
-                unsafe_allow_html=True,
+                unsafe_allow_html=True
             )
 
-# ── Accuracy Notes tab ────────────────────────────────────────────────────────
-with tab_about:
-    st.markdown(
-        """
-        ## How Accuracy Works
+with st.expander("ℹ️ Accuracy Notes", expanded=False):
 
-        **Factual questions** (What is X? What value does clause Y specify?)
-        The assistant extracts exact numbers, clause references, party names, and specifications
-        directly from the contract text. Verify by checking the **References** tab.
+    st.markdown("""
+### How Accuracy Works
 
-        **Descriptive questions** (Summarize / Describe / What are the responsibilities for…?)
-        The assistant synthesizes information from multiple retrieved segments into a structured answer.
-        More segments are retrieved automatically for descriptive queries. Check the References tab
-        to confirm every point is grounded in the contract text.
+**Factual questions**
+The assistant extracts exact numbers, clauses, specifications and values from the contract.
 
-        ## Verification Strategy
+**Descriptive questions**
+The assistant synthesizes information from multiple retrieved sections.
 
-        1. Ask a question you already know the answer to from the contract.
-        2. Confirm the answer matches.
-        3. Open **References** and check which segment contains the answer.
-        4. If something seems off, note the *score* — lower-scored segments may be partial matches.
+### Verification
 
-        ## Limitations
-
-        - The assistant can only answer from what is indexed. If a clause exists in a file
-          that was not indexed, it will not appear.
-        - Scanned PDFs with poor OCR may produce garbled text in the index.
-        - After updating or adding contract files, **rebuild the index** and redeploy.
-
-        ## Rebuild Index
-
-        ```powershell
-        python local_contract_server.py build --source-dir "C:\\Users\\INP\\Desktop\\ISP Burnpur contract"
-        ```
-        Then commit the updated `index/` folder to GitHub.
-        """
-    )
+1. Ask a question.
+2. Review the answer.
+3. Open References Used.
+4. Verify the supporting excerpts.
+""")
