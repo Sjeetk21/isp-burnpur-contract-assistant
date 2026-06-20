@@ -21,10 +21,11 @@ class Config:
     child_word_limit: int = 220
     child_overlap: int = 40
     model: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    top_k: int = 8
+    top_k: int = 10
 
 
 SUPPORTED = {".docx", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".csv"}
+
 QUERY_EXPANSION = {
     "wr": "work roll",
     "bur": "backup roll",
@@ -34,17 +35,41 @@ QUERY_EXPANSION = {
     "tph": "tons per hour",
     "qap": "quality assurance plan",
     "ic": "inspection certificate",
+    "pmt": "per metric ton",
+    "haz": "hazardous",
+    "env": "environment",
+    "ppe": "personal protective equipment",
+    "sox": "scope of work",
 }
+
 ROUTE_TERMS = {
-    "capacity": ["capacity", "mtpa", "tph", "million tonnes"],
-    "safety": ["safety", "hazard", "ppe", "fire", "emergency"],
-    "inspection": ["inspection", "qap", "witness", "review", "test certificate"],
-    "scope": ["scope", "supply", "battery limit", "exclusion", "interface"],
-    "dimension": ["width", "thickness", "diameter", "length", "mm"],
-    "payment": ["payment", "billing", "invoice", "price"],
+    "capacity": ["capacity", "mtpa", "tph", "million tonnes", "output", "production"],
+    "safety": ["safety", "hazard", "ppe", "fire", "emergency", "accident", "protective"],
+    "inspection": ["inspection", "qap", "witness", "review", "test certificate", "quality"],
+    "scope": ["scope", "supply", "battery limit", "exclusion", "interface", "included", "not included"],
+    "dimension": ["width", "thickness", "diameter", "length", "mm", "tolerance", "gauge"],
+    "payment": ["payment", "billing", "invoice", "price", "rate", "milestone", "advance"],
+    "contractor": ["contractor", "responsibility", "obligation", "erection", "installation"],
+    "material": ["material", "steel", "grade", "specification", "standard", "is code", "astm"],
+    "timeline": ["schedule", "completion", "milestone", "deadline", "delivery", "commission"],
+    "warranty": ["warranty", "guarantee", "defect", "liability", "performance"],
 }
 
+# ─── Question-type detection ──────────────────────────────────────────────────
+_DESCRIPTIVE_RE = re.compile(
+    r"\b(explain|describe|summarize|summarise|what are|what is included|tell me about|"
+    r"how does|how do|elaborate|detail|overview|outline|list all|list the|"
+    r"what should|provide|enumerate|break down|cover|give me|elaborate on|"
+    r"responsibilities|obligations|requirements|procedures|guidelines|steps|process)\b",
+    re.IGNORECASE,
+)
 
+
+def is_descriptive(question: str) -> bool:
+    return bool(_DESCRIPTIVE_RE.search(question))
+
+
+# ─── Text utilities ────────────────────────────────────────────────────────────
 def norm(text: Any) -> str:
     return re.sub(r"\s+", " ", "" if text is None else str(text).replace("\u00a0", " ")).strip()
 
@@ -67,6 +92,7 @@ def chunk_words(words: list[str], size: int, overlap: int) -> list[str]:
     return chunks
 
 
+# ─── Parsers ──────────────────────────────────────────────────────────────────
 def parse_docx(path: Path) -> list[dict[str, Any]]:
     from docx import Document
 
@@ -138,6 +164,7 @@ def source_files(root: str) -> list[Path]:
     )
 
 
+# ─── Index builder ─────────────────────────────────────────────────────────────
 def load_records(config: Config) -> list[dict[str, Any]]:
     parsers = {
         ".docx": parse_docx,
@@ -197,7 +224,9 @@ def build_index(config: Config) -> dict[str, Any]:
         "route_index": route_index,
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    Path(config.index_dir, "contract_index.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    Path(config.index_dir, "contract_index.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
     summary = {
         "source_dir": Path(config.source_dir).name,
         "source_files": len(source_files(config.source_dir)),
@@ -209,14 +238,17 @@ def build_index(config: Config) -> dict[str, Any]:
     return summary
 
 
+# ─── Search & retrieval ────────────────────────────────────────────────────────
 class ContractIndex:
     def __init__(self, index_dir: str = "index"):
         payload = json.loads(Path(index_dir, "contract_index.json").read_text(encoding="utf-8"))
-        self.children = payload["children"]
-        self.doc_freq = payload["doc_freq"]
-        self.avg_len = payload["avg_len"]
-        self.route_index = payload["route_index"]
-        self.n_docs = max(len(self.children), 1)
+        self.children: list[dict] = payload["children"]
+        self.doc_freq: dict[str, int] = payload["doc_freq"]
+        self.avg_len: float = payload["avg_len"]
+        self.route_index: dict[str, list[int]] = payload["route_index"]
+        self.n_docs: int = max(len(self.children), 1)
+        # Build fast id-lookup
+        self._by_id: dict[int, dict] = {c["id"]: c for c in self.children}
 
     def expand_query(self, query: str) -> str:
         expanded = query
@@ -228,13 +260,13 @@ class ContractIndex:
 
     def route_bonus_ids(self, query: str) -> set[int]:
         lower = query.lower()
-        ids = set()
+        ids: set[int] = set()
         for route, terms in ROUTE_TERMS.items():
             if route in lower or any(term in lower for term in terms):
-                ids.update(self.route_index.get(route, [])[:80])
+                ids.update(self.route_index.get(route, [])[:100])
         return ids
 
-    def search(self, query: str, top_k: int = 8) -> list[dict[str, Any]]:
+    def search(self, query: str, top_k: int = 10) -> list[dict[str, Any]]:
         query = self.expand_query(query)
         q_tokens = tokens(query)
         bonus_ids = self.route_bonus_ids(query)
@@ -244,7 +276,7 @@ class ContractIndex:
             text_tokens = tokens(child["text"])
             if not text_tokens:
                 continue
-            freq = {}
+            freq: dict[str, int] = {}
             for tok in text_tokens:
                 freq[tok] = freq.get(tok, 0) + 1
             score = 0.0
@@ -259,48 +291,139 @@ class ContractIndex:
                 score += 1.5
             if score > 0:
                 scored.append({**child, "score": score})
-        return sorted(scored, key=lambda item: item["score"], reverse=True)[:top_k]
+        top = sorted(scored, key=lambda x: x["score"], reverse=True)[:top_k]
+        return self._enrich_with_neighbors(top, top_k)
+
+    def _enrich_with_neighbors(self, hits: list[dict], top_k: int) -> list[dict]:
+        """Fetch adjacent chunks from same parent to provide fuller context around each hit."""
+        seen_ids: set[int] = {h["id"] for h in hits}
+        extra: list[dict] = []
+        for hit in hits[:6]:  # Only expand top-6 hits to stay within token budget
+            pid = hit["parent_id"]
+            cidx = hit["chunk_index"]
+            for child in self.children:
+                if (
+                    child["parent_id"] == pid
+                    and child["id"] not in seen_ids
+                    and abs(child["chunk_index"] - cidx) == 1
+                ):
+                    extra.append({**child, "score": hit["score"] * 0.75, "_neighbor": True})
+                    seen_ids.add(child["id"])
+        combined = hits + extra
+        combined.sort(key=lambda x: x["score"], reverse=True)
+        return combined[:top_k + 4]  # Allow slightly more when neighbors are added
 
 
+# ─── Answer generation ─────────────────────────────────────────────────────────
 def citation_line(item: dict[str, Any], idx: int) -> str:
     meta = item["metadata"]
     page = f", page/row {meta['page_number']}" if meta.get("page_number") else ""
-    return f"{idx}. {meta['source_file']} | {meta['section']}{page}"
+    return f"[{idx}] {meta['source_file']} | {meta['section']}{page}"
+
+
+_PROMPT_FACTUAL = """\
+You are a Senior Contract Review Engineer for the ISP Burnpur Hot Strip Mill project.
+
+TASK: Answer the user's question strictly from the verified contract segments provided below. \
+Your answer must be precise, complete, and directly grounded in the text.
+
+RULES FOR FACTUAL ANSWERS:
+- Extract and state every relevant number, measurement, clause reference, party name, \
+deadline, or specification exactly as written in the contract.
+- If multiple segments address the same point, synthesize them into a single clear answer.
+- Structure your answer in short, clear paragraphs. Use bullet points only when there is a list of items.
+- Do NOT speculate or add information not present in the segments.
+- If the answer is not found in the segments, say: \
+"This specific information was not found in the retrieved contract sections."
+
+CONTRACT SEGMENTS:
+{context}
+
+QUESTION: {question}
+
+ANSWER:"""
+
+_PROMPT_DESCRIPTIVE = """\
+You are a Senior Contract Review Engineer for the ISP Burnpur Hot Strip Mill project.
+
+TASK: Provide a comprehensive, well-structured answer to the user's question \
+using ONLY the verified contract segments provided below.
+
+RULES FOR DESCRIPTIVE ANSWERS:
+1. Structure your response with clear Markdown headings (## Heading) for each major aspect.
+2. Under each heading, use bullet points with specific details — exact values, \
+clause references, responsible parties, and exceptions where present.
+3. Cover ALL relevant aspects found in the segments: scope, responsibilities, \
+requirements, exclusions, safety, inspection, payment, timelines — whatever applies.
+4. Be thorough. This is a contract review, so completeness is essential.
+5. After the main answer, add a "## Key Takeaways" section with 3–5 critical points.
+6. If some aspects are not covered in the retrieved segments, note: \
+"Information on [aspect] was not found in the retrieved sections."
+7. Do NOT speculate or infer beyond what is written.
+
+CONTRACT SEGMENTS:
+{context}
+
+QUESTION: {question}
+
+ANSWER (use Markdown headings and bullets):"""
 
 
 def gemini_answer(question: str, hits: list[dict[str, Any]], model: str) -> str:
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+    # Deduplicate hits by (source_file, section) — keep highest scored per source
+    seen_sources: dict[str, float] = {}
+    deduped: list[dict] = []
+    for hit in hits:
+        meta = hit["metadata"]
+        key = f"{meta['source_file']}|{meta.get('section', '')}"
+        if key not in seen_sources or hit["score"] > seen_sources[key]:
+            seen_sources[key] = hit["score"]
+            deduped.append(hit)
+
     context = "\n\n".join(
         f"--- SEGMENT {idx} ---\nSOURCE: {citation_line(hit, idx)}\n{hit['text']}"
-        for idx, hit in enumerate(hits, 1)
+        for idx, hit in enumerate(deduped, 1)
     )
-    citations = "\n".join(citation_line(hit, idx) for idx, hit in enumerate(hits, 1))
-    if not api_key:
-        return "Set GEMINI_API_KEY or GOOGLE_API_KEY to generate an answer.\n\nRetrieved evidence:\n" + citations
+    citations = "\n".join(citation_line(hit, idx) for idx, hit in enumerate(deduped, 1))
 
-    prompt = (
-        "You are a Principal Contract AI Assistant for the ISP Burnpur Hot Strip Mill project. "
-        "Answer only from the verified contract segments. Preserve exact numbers, clause references, "
-        "technical parameters, responsibilities, and exceptions. If the context is insufficient, say so.\n\n"
-        f"CONTRACT SEGMENTS:\n{context}\n\nQUESTION: {question}\n\nANSWER:"
-    )
+    if not api_key:
+        return (
+            "⚠️ **Gemini API key not set.** Add `GEMINI_API_KEY` in Streamlit Cloud secrets "
+            "to enable AI-generated answers.\n\n**Retrieved evidence (unprocessed):**\n" + citations
+        )
+
+    descriptive = is_descriptive(question)
+    prompt_template = _PROMPT_DESCRIPTIVE if descriptive else _PROMPT_FACTUAL
+    prompt = prompt_template.format(context=context, question=question)
+
+    # More tokens for descriptive answers
+    max_tokens = 3000 if descriptive else 1800
+
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1400},
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": max_tokens},
     }).encode("utf-8")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=90) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         text = payload["candidates"][0]["content"]["parts"][0]["text"]
-        return f"{text}\n\nOfficial contract references:\n{citations}"
+        return f"{text}\n\n---\n**Contract References:**\n{citations}"
     except urllib.error.HTTPError as exc:
-        return f"Gemini API error {exc.code}: {exc.read().decode('utf-8', errors='ignore')}\n\nRetrieved evidence:\n{citations}"
+        err = exc.read().decode("utf-8", errors="ignore")
+        return f"⚠️ Gemini API error {exc.code}: {err}\n\n**Retrieved segments:**\n{citations}"
     except Exception as exc:
-        return f"Gemini request failed: {exc}\n\nRetrieved evidence:\n{citations}"
+        return f"⚠️ Gemini request failed: {exc}\n\n**Retrieved segments:**\n{citations}"
 
 
+# ─── CLI helpers ───────────────────────────────────────────────────────────────
 def ask(question: str, config: Config) -> dict[str, Any]:
     index = ContractIndex(config.index_dir)
     hits = index.search(question, config.top_k)
@@ -308,6 +431,7 @@ def ask(question: str, config: Config) -> dict[str, Any]:
     return {"answer": answer, "hits": hits}
 
 
+# ─── Lightweight local HTTP server ─────────────────────────────────────────────
 HTML = """<!doctype html>
 <html>
 <head>
@@ -315,32 +439,39 @@ HTML = """<!doctype html>
   <title>ISP Burnpur Contract Assistant</title>
   <style>
     body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f6f7f9; color: #1f2937; }
-    header { background: #123; color: white; padding: 18px 28px; }
+    header { background: #0f2d4a; color: white; padding: 18px 28px; }
     main { max-width: 1100px; margin: 0 auto; padding: 24px; }
-    textarea { width: 100%; min-height: 80px; padding: 12px; font-size: 15px; box-sizing: border-box; }
-    button { margin-top: 10px; padding: 10px 16px; background: #0f5c8c; color: white; border: 0; border-radius: 4px; cursor: pointer; }
-    pre { white-space: pre-wrap; background: white; padding: 16px; border: 1px solid #d7dce2; border-radius: 6px; }
+    textarea { width: 100%; min-height: 80px; padding: 12px; font-size: 15px; box-sizing: border-box; border: 1px solid #ccd; border-radius: 6px; }
+    button { margin-top: 10px; padding: 10px 20px; background: #0f5c8c; color: white; border: 0; border-radius: 4px; cursor: pointer; font-size: 15px; }
+    button:hover { background: #0a4a72; }
+    pre { white-space: pre-wrap; background: white; padding: 16px; border: 1px solid #d7dce2; border-radius: 6px; line-height: 1.55; }
     .hit { background: white; border: 1px solid #d7dce2; border-radius: 6px; padding: 12px; margin: 12px 0; }
-    .muted { color: #596579; font-size: 13px; }
+    .muted { color: #596579; font-size: 13px; margin-bottom: 6px; }
   </style>
 </head>
 <body>
-<header><h2>ISP Burnpur Contract Assistant</h2><div>Local evidence search with Gemini-grounded answers</div></header>
+<header><h2 style="margin:0">ISP Burnpur Contract Assistant</h2><div style="font-size:13px;margin-top:4px">Local evidence search · Gemini-grounded answers</div></header>
 <main>
   <textarea id="q" placeholder="Ask about safety, scope, inspection, capacity, exclusions, payment..."></textarea>
-  <br><button onclick="ask()">Ask Contract</button>
-  <h3>Answer</h3><pre id="answer">Ready.</pre>
-  <h3>Evidence</h3><div id="hits"></div>
+  <br><button onclick="doAsk()">Ask Contract</button>
+  <h3>Answer</h3><pre id="answer">Ready — enter a question above.</pre>
+  <h3>Evidence Segments</h3><div id="hits"></div>
 </main>
 <script>
-async function ask() {
-  const question = document.getElementById('q').value;
-  document.getElementById('answer').textContent = 'Searching...';
+async function doAsk() {
+  const question = document.getElementById('q').value.trim();
+  if (!question) return;
+  document.getElementById('answer').textContent = 'Searching contract…';
   const res = await fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question})});
   const data = await res.json();
   document.getElementById('answer').textContent = data.answer;
-  document.getElementById('hits').innerHTML = data.hits.map((h, i) => `<div class="hit"><b>${i+1}. ${h.metadata.source_file}</b><div class="muted">${h.metadata.section} | page/row ${h.metadata.page_number || ''} | score ${h.score.toFixed(3)}</div><div>${h.text.substring(0,1200)}</div></div>`).join('');
+  document.getElementById('hits').innerHTML = data.hits.map((h, i) =>
+    `<div class="hit"><b>${i+1}. ${h.metadata.source_file}</b>
+     <div class="muted">${h.metadata.section} | page/row ${h.metadata.page_number || '—'} | score ${h.score.toFixed(3)}</div>
+     <div>${h.text.substring(0,1400)}</div></div>`
+  ).join('');
 }
+document.getElementById('q').addEventListener('keydown', e => { if (e.ctrlKey && e.key === 'Enter') doAsk(); });
 </script>
 </body>
 </html>"""
@@ -374,29 +505,33 @@ class Handler(BaseHTTPRequestHandler):
         result = ask(payload.get("question", ""), self.config)
         self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
+    def log_message(self, fmt, *args):  # silence request logs
+        pass
+
 
 def serve(config: Config, host: str, port: int) -> None:
     Handler.config = config
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"Open http://{host}:{port}")
+    print(f"✔ Local server running → http://{host}:{port}  (Ctrl-C to stop)")
     server.serve_forever()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="ISP Burnpur Contract Assistant")
     parser.add_argument("command", choices=["build", "ask", "serve"])
     parser.add_argument("--source-dir", default=Config().source_dir)
     parser.add_argument("--index-dir", default=Config().index_dir)
     parser.add_argument("--question", default="")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
-    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--top-k", type=int, default=10)
     args = parser.parse_args()
     config = Config(source_dir=args.source_dir, index_dir=args.index_dir, top_k=args.top_k)
     if args.command == "build":
         print(json.dumps(build_index(config), indent=2))
     elif args.command == "ask":
-        print(json.dumps(ask(args.question, config), indent=2, ensure_ascii=False))
+        result = ask(args.question, config)
+        print(result["answer"])
     else:
         serve(config, args.host, args.port)
 
